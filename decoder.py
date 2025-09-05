@@ -69,6 +69,7 @@ class TransformerDecoderLayer(nn.Module):
             rpb_max_distance=rpb_max_distance,
             rpb_bidirectional=rpb_bidirectional,
         )
+        #calls from before
         self.ffn = PositionwiseFFN(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model, eps=norm_eps)
         self.norm2 = nn.LayerNorm(d_model, eps=norm_eps)
@@ -92,15 +93,17 @@ class TransformerDecoderLayer(nn.Module):
             key_padding_mask=self_key_padding_mask,
             use_rope_q=True, use_rope_k=True,
         )
+        #self attention for tokens produced so far
         x = x + self.drop1(h)
-
+        #residual connections to not lose info
         h = self.norm2(x)
         h, cross_attn_weights = self.cross_attn(
-            h, memory, memory,
+            h, memory, memory, #memory encoder outputs
             attn_mask=None,
             key_padding_mask=cross_key_padding_mask,
             use_rope_q=True, use_rope_k=True,
         )
+        #contextualised vectors attneding on encoder output tokens
         x = x + self.drop2(h)
 
         h = self.norm3(x)
@@ -121,7 +124,7 @@ class TransformerDecoder(nn.Module):
         pad_idx: int,
         dropout: float = 0.1,
         self_pos_encoding: str = "rope",
-        cross_pos_encoding: str = "none",
+        cross_pos_encoding: str = "none", #cos what I cant calculate relatives across encoder out and decoder in order change in translation
         tie_embeddings: bool = False,
         rope_base: float = 10000.0,
         rpb_num_buckets: int = 32,
@@ -135,8 +138,9 @@ class TransformerDecoder(nn.Module):
         self.pad_idx = pad_idx
 
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
+        #the learned ebeddings for input tokens
         self.drop = nn.Dropout(dropout)
-
+        #dropout heheheha
         self.layers = nn.ModuleList([
             TransformerDecoderLayer(
                 d_model=d_model,
@@ -152,11 +156,14 @@ class TransformerDecoder(nn.Module):
                 norm_eps=norm_eps,
             )
             for _ in range(num_layers)
+            #jsut setting up layers
         ])
         self.final_norm = nn.LayerNorm(d_model, eps=norm_eps)
 
         self.generator = nn.Linear(d_model, vocab_size, bias=False)
+        #scale to probabilities across vocabulary matrix
         if tie_embeddings:
+            #possible to tie embeddings i.e vector * embmat for encoding and decoding = hidden * (embmat)^T essentially reuse transpose
             if self.embed.weight.shape != self.generator.weight.shape:
                 raise ValueError("Cannot tie embeddings: shape mismatch.")
             self.generator.weight = self.embed.weight
@@ -171,7 +178,7 @@ class TransformerDecoder(nn.Module):
     ):
         x = self.embed(tgt_tokens) * (self.d_model ** 0.5)
         x = self.drop(x)
-
+        #apply dropout for regularisation
         caches = {"self_attn": [], "cross_attn": []}
         for layer in self.layers:
             x, cache = layer(
@@ -186,6 +193,7 @@ class TransformerDecoder(nn.Module):
 
         x = self.final_norm(x)
         logits = self.generator(x)
+        #generate output tokens
         return logits, caches
 
 if __name__ == "__main__":

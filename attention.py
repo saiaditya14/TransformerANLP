@@ -33,13 +33,13 @@ def rope_cos_sin(seq_len: int, dim: int, base: float, device, dtype) -> Tuple[to
 #essentially above apply RoPe formula 1/base^... for hidden_dim/2 then rotate embedding i.e per position frequency associated with it then spread out and cos and sin
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    while cos.dim() < x.dim():
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    #just that cos and sin shape doen match with x's size, and broadcast across heads and batches
     return (x * cos) + (rotate(x) * sin)
-#break 1
 
 class RelativePositionBias(nn.Module):
+    #While calculating scores we have to add bias(k-q) where bias is a learnable parameter per possible difference in relative position
     def __init__(self, num_heads: int, num_buckets: int = 32, max_distance: int = 128, bidirectional: bool = True):
         super().__init__()
         self.num_heads = num_heads
@@ -48,9 +48,21 @@ class RelativePositionBias(nn.Module):
         self.bidirectional = bidirectional
         total_buckets = num_buckets * 2 if bidirectional else num_buckets
         self.emb = nn.Embedding(total_buckets, num_heads)
-
+        #above just creates a learnable lookup table for how 
+        # [total_buckets, num_heads] = [total_buckets][num_heads]
     def _relative_position_bucket(self, rel_pos: torch.Tensor) -> torch.Tensor:
         n = self.num_buckets
+        #vectorised code for element wise iteration needed the speed
+        #could loop over everything but just too slow
+        #just look at it is as iterating over i's and j's in rel then doing each of below branch steps
+        #buckets = torch.zeros_like(rel)
+        #for i in range(Q):
+        #    for j in range(K):
+        #        if rel[i,j] < max_exact:
+        #            buckets[i,j] = rel[i,j]
+        #        else:
+        #            buckets[i,j] = int( log(rel[i,j]/max_exact) / log(max_distance/max_exact) * (half-max_exact) )
+
         if self.bidirectional:
             sign = (rel_pos > 0).to(torch.long)
             rel = rel_pos.abs()
@@ -62,7 +74,9 @@ class RelativePositionBias(nn.Module):
                 * (half - max_exact)
             ).to(torch.long)
             large = large.clamp(max=half - 1)
+            #clipping
             buckets = torch.where(is_small, rel, large)
+            #vectorised comparison just looping over i's and j's and checking if is_small or not
             buckets = buckets + sign * half
             total = 2 * n
             return buckets.clamp(min=0, max=total - 1)
@@ -79,12 +93,14 @@ class RelativePositionBias(nn.Module):
             return buckets.clamp(min=0, max=n - 1)
 
     def forward(self, q_len: int, k_len: int, device=None, dtype=None) -> torch.Tensor:
-        q_pos = torch.arange(q_len, device=device)
-        k_pos = torch.arange(k_len, device=device)
-        rel = k_pos[None, :] - q_pos[:, None]
+        rel = torch.zeros((q_len,k_len), dtype = torch.long, device=device)
+        for i in range (q_len):
+            for j in range (k_len):
+                rel[i][j] = j - i
         buckets = self._relative_position_bucket(rel)
-        bias = self.emb(buckets).permute(2, 0, 1)
+        bias = self.emb(buckets).permute(2,0,1)
         return bias.unsqueeze(0)
+        #Note to self Vectorised version k_pos[None, :] - q_pos[:, None]
 
 class MultiHeadAttention(nn.Module):
     def __init__(
@@ -125,6 +141,7 @@ class MultiHeadAttention(nn.Module):
 
     def _shape(self, x: torch.Tensor, B: int) -> torch.Tensor:
         return x.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+    #split to number heads
 
     def forward(
         self,
@@ -142,7 +159,7 @@ class MultiHeadAttention(nn.Module):
         Q = self._shape(self.W_q(query), B)
         K = self._shape(self.W_k(key),   B)
         V = self._shape(self.W_v(value), B)
-
+        #applying rope
         if self.pos_encoding == "rope":
             cos_q, sin_q = rope_cos_sin(QL, self.head_dim, self.rope_base, Q.device, Q.dtype)
             cos_k, sin_k = rope_cos_sin(KL, self.head_dim, self.rope_base, K.device, K.dtype)
@@ -152,21 +169,24 @@ class MultiHeadAttention(nn.Module):
                 K = apply_rope(K, cos_k, sin_k)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
+        #or rpb 
         if self.pos_encoding == "rpb":
             bias = self.rpb(QL, KL, device=scores.device, dtype=scores.dtype)
             scores = scores + bias
-
-        mask = comb(attn_mask, key_padding_mask) if comb is not None else (attn_mask if key_padding_mask is None else key_padding_mask if attn_mask is None else (attn_mask | key_padding_mask))
+        #same mask work as in encoder
+        mask = comb(attn_mask, key_padding_mask) #if comb is not None else (attn_mask if key_padding_mask is None else key_padding_mask if attn_mask is None else (attn_mask | key_padding_mask))
         if mask is not None:
             scores = scores.masked_fill(mask, -1e9)
 
         attn = F.softmax(scores, dim=-1)
+        #contextualised embeddings woohoo
         attn = self.dropout(attn)
         out = torch.matmul(attn, V)
 
         out = out.transpose(1, 2).contiguous().view(B, QL, self.d_model)
+        #concatenate
         out = self.W_o(out)
+        #learned way to mix heads
         return out, attn
 
 if __name__ == "__main__":

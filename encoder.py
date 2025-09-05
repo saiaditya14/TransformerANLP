@@ -37,6 +37,7 @@ class TransformerEncoderLayer(nn.Module):
             rpb_max_distance=rpb_max_distance,
             rpb_bidirectional=rpb_bidirectional,
         )
+        #heheheha
         self.ffn = PositionwiseFFN(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model, eps=norm_eps)
         self.norm2 = nn.LayerNorm(d_model, eps=norm_eps)
@@ -47,7 +48,7 @@ class TransformerEncoderLayer(nn.Module):
         h = self.norm1(src)
         h, attn_w = self.self_attn(h, h, h, attn_mask=None, key_padding_mask=src_key_padding_mask, use_rope_q=True, use_rope_k=True)
         src = src + self.drop1(h)
-
+        #residuals
         h = self.norm2(src)
         h = self.ffn(h)
         src = src + self.drop2(h)
@@ -109,7 +110,7 @@ class TransformerEncoder(nn.Module):
 
         x = self.final_norm(x)
         return x, attn_caches
-
+#straightforward
 #main explanations needed written in decoder.py
 if __name__ == "__main__":
     torch.manual_seed(0)

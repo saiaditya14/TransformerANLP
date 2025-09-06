@@ -1,95 +1,180 @@
-# Assumption: dataset is two files data/src.txt and data/tgt.txt with token ids per line separated by spaces (e.g. "12 45 78 2")
-import os, torch, torch.nn as nn, torch.optim as optim
+# train.py
+# Assumption: data/{src.txt,tgt.txt} exist (token-id lines). If no splits, this script will create train/val/test splits.
+import argparse, os, random, csv, json
+from typing import Tuple, List
+import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple
 from encoder import TransformerEncoder
 from decoder import TransformerDecoder
 from utils import pad_msk
 
-PAD_IDX = 0
-BOS_IDX = 1
-EOS_IDX = 2
-VOCAB_MIN = 1000
-D_MODEL = 128
-NUM_HEADS = 8
-NUM_LAYERS = 2
-D_FF = 4 * D_MODEL
-BATCH = 32
-LR = 1e-3
-EPOCHS = 5
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DATA_DIR = "data"
+PAD_IDX = 0; BOS_IDX = 1; EOS_IDX = 2
 
-class ParallelTxtIdDataset(Dataset):
-    def __init__(self, src_path: str, tgt_path: str):
-        with open(src_path, "r", encoding="utf-8") as f:
-            self.src_lines = [list(map(int, line.strip().split())) for line in f if line.strip()]
-        with open(tgt_path, "r", encoding="utf-8") as f:
-            self.tgt_lines = [list(map(int, line.strip().split())) for line in f if line.strip()]
-        assert len(self.src_lines) == len(self.tgt_lines)
-    def __len__(self):
-        return len(self.src_lines)
-    def __getitem__(self, idx):
-        return self.src_lines[idx], self.tgt_lines[idx]
+class ParallelIdDataset(Dataset):
+    def __init__(self, src_lines: List[List[int]], tgt_lines: List[List[int]]):
+        assert len(src_lines) == len(tgt_lines)
+        self.src = src_lines; self.tgt = tgt_lines
+    def __len__(self): return len(self.src)
+    def __getitem__(self, idx): return self.src[idx], self.tgt[idx]
 
-def collate_fn(batch: List[Tuple[List[int], List[int]]]):
+def read_id_file(path: str) -> List[List[int]]:
+    out=[]
+    with open(path,'r',encoding='utf-8') as f:
+        for ln in f:
+            ln=ln.strip()
+            if ln=="":
+                out.append([])
+            else:
+                out.append(list(map(int, ln.split())))
+    return out
+
+def write_id_file(path: str, data: List[List[int]]):
+    with open(path,'w',encoding='utf-8') as f:
+        for seq in data:
+            f.write(" ".join(map(str, seq)) + "\n")
+
+def collate_fn(batch):
     srcs, tgts = zip(*batch)
     B = len(srcs)
-    S = max(len(s) for s in srcs)
-    T = max(len(t) + 1 for t in tgts)
-    src_tensor = torch.full((B, S), PAD_IDX, dtype=torch.long)
-    tgt_output = torch.full((B, T), PAD_IDX, dtype=torch.long)
-    tgt_input = torch.full((B, T), PAD_IDX, dtype=torch.long)
-    for i, (s, t) in enumerate(zip(srcs, tgts)):
-        src_tensor[i, :len(s)] = torch.tensor(s, dtype=torch.long)
-        if len(t) == 0 or t[-1] != EOS_IDX:
-            t_with_eos = list(t) + [EOS_IDX]
-        else:
-            t_with_eos = list(t)
-        L = len(t_with_eos)
-        tgt_output[i, :L] = torch.tensor(t_with_eos, dtype=torch.long)
-        tgt_input[i, 0] = BOS_IDX
-        if L > 1:
-            tgt_input[i, 1:L] = torch.tensor(t_with_eos[:-1], dtype=torch.long)
-    return src_tensor, tgt_input, tgt_output
+    S = max((len(s) for s in srcs), default=0)
+    T = max((len(t) + 1 for t in tgts), default=1)
+    src_tensor = torch.full((B,S), PAD_IDX, dtype=torch.long)
+    tgt_out = torch.full((B,T), PAD_IDX, dtype=torch.long)
+    tgt_in = torch.full((B,T), PAD_IDX, dtype=torch.long)
+    for i,(s,t) in enumerate(zip(srcs,tgts)):
+        if s: src_tensor[i,:len(s)] = torch.tensor(s, dtype=torch.long)
+        if len(t)==0 or t[-1]!=EOS_IDX: t2 = list(t)+[EOS_IDX]
+        else: t2 = list(t)
+        L = len(t2)
+        tgt_out[i,:L] = torch.tensor(t2, dtype=torch.long)
+        tgt_in[i,0] = BOS_IDX
+        if L>1:
+            tgt_in[i,1:L] = torch.tensor(t2[:-1], dtype=torch.long)
+    return src_tensor, tgt_in, tgt_out
 
-src_path = os.path.join(DATA_DIR, "src.txt")
-tgt_path = os.path.join(DATA_DIR, "tgt.txt")
-dataset = ParallelTxtIdDataset(src_path, tgt_path)
-max_id = 0
-for s, t in dataset:
-    if s: max_id = max(max_id, max(s))
-    if t: max_id = max(max_id, max(t))
-VOCAB = max(VOCAB_MIN, max_id + 1)
-loader = DataLoader(dataset, batch_size=BATCH, shuffle=True, collate_fn=collate_fn, num_workers=2)
+def make_splits(src_path, tgt_path, out_dir, val_frac=0.05, test_frac=0.05, seed=42):
+    src = read_id_file(src_path); tgt = read_id_file(tgt_path)
+    assert len(src)==len(tgt)
+    N = len(src)
+    idx = list(range(N))
+    random.Random(seed).shuffle(idx)
+    t_cnt = int(N * (1 - val_frac - test_frac))
+    v_cnt = int(N * val_frac)
+    train_idx = idx[:t_cnt]
+    val_idx = idx[t_cnt:t_cnt+v_cnt]
+    test_idx = idx[t_cnt+v_cnt:]
+    def subset(idxs):
+        return [src[i] for i in idxs], [tgt[i] for i in idxs]
+    os.makedirs(out_dir, exist_ok=True)
+    s_tr, t_tr = subset(train_idx)
+    s_v, t_v = subset(val_idx)
+    s_te, t_te = subset(test_idx)
+    write_id_file(os.path.join(out_dir,'train.src.txt'), s_tr)
+    write_id_file(os.path.join(out_dir,'train.tgt.txt'), t_tr)
+    write_id_file(os.path.join(out_dir,'val.src.txt'), s_v)
+    write_id_file(os.path.join(out_dir,'val.tgt.txt'), t_v)
+    write_id_file(os.path.join(out_dir,'test.src.txt'), s_te)
+    write_id_file(os.path.join(out_dir,'test.tgt.txt'), t_te)
+    return
 
-enc = TransformerEncoder(VOCAB, D_MODEL, NUM_LAYERS, NUM_HEADS, D_FF, pad_idx=PAD_IDX, pos_encoding="rope").to(DEVICE)
-dec = TransformerDecoder(VOCAB, D_MODEL, NUM_LAYERS, NUM_HEADS, D_FF, pad_idx=PAD_IDX, self_pos_encoding="rope").to(DEVICE)
-params = list(enc.parameters()) + list(dec.parameters())
-opt = optim.Adam(params, lr=LR)
-criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+def build_masks(src, tgt_in, device):
+    enc_pad = pad_msk(src, pad_idx=PAD_IDX).to(device)
+    dec_pad = pad_msk(tgt_in, pad_idx=PAD_IDX).to(device)
+    T = tgt_in.size(1)
+    tri = torch.tril(torch.ones((T,T), dtype=torch.bool, device=device))
+    fut = (~tri).unsqueeze(0).unsqueeze(0)
+    return enc_pad, fut, dec_pad
 
-for epoch in range(1, EPOCHS + 1):
+def train_epoch(enc, dec, loader, opt, crit, device, args):
     enc.train(); dec.train()
-    total_loss = 0.0
-    for step, (src, decoder_input, decoder_target) in enumerate(loader, start=1):
-        src = src.to(DEVICE)
-        decoder_input = decoder_input.to(DEVICE)
-        decoder_target = decoder_target.to(DEVICE)
-        enc_pad = pad_msk(src, pad_idx=PAD_IDX).to(DEVICE)
-        dec_pad = pad_msk(decoder_input, pad_idx=PAD_IDX).to(DEVICE)
-        tri = torch.tril(torch.ones((decoder_input.size(1), decoder_input.size(1)), dtype=torch.bool, device=DEVICE))
-        fut = (~tri).unsqueeze(0).unsqueeze(0)
-        memory, _ = enc(src, enc_pad)
-        logits, _ = dec(decoder_input, memory, fut, dec_pad, enc_pad)
-        B, T, V = logits.shape
-        loss = criterion(logits.view(B * T, V), decoder_target.view(B * T))
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
+    total_loss=0.0; steps=0
+    for src, tgt_in, tgt_out in loader:
+        src = src.to(device); tgt_in = tgt_in.to(device); tgt_out = tgt_out.to(device)
+        enc_pad, fut, dec_pad = build_masks(src, tgt_in, device)
+        mem,_ = enc(src, enc_pad)
+        logits,_ = dec(tgt_in, mem, fut, dec_pad, enc_pad)
+        B,T,V = logits.shape
+        loss = crit(logits.view(B*T,V), tgt_out.view(B*T))
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(enc.parameters())+list(dec.parameters()), 1.0)
         opt.step()
-        total_loss += loss.item()
-        if step % 50 == 0:
-            print(f"Epoch {epoch} step {step} avg_loss {total_loss / step:.4f}")
-    print(f"Epoch {epoch} finished avg_loss {total_loss / len(loader):.4f}")
-    torch.save({"encoder": enc.state_dict(), "decoder": dec.state_dict()}, f"checkpoint_epoch{epoch}.pt")
+        total_loss += loss.item(); steps += 1
+    return total_loss/steps if steps>0 else 0.0
+
+def eval_epoch(enc, dec, loader, crit, device, args):
+    enc.eval(); dec.eval()
+    total_loss=0.0; steps=0
+    with torch.no_grad():
+        for src, tgt_in, tgt_out in loader:
+            src = src.to(device); tgt_in = tgt_in.to(device); tgt_out = tgt_out.to(device)
+            enc_pad, fut, dec_pad = build_masks(src, tgt_in, device)
+            mem,_ = enc(src, enc_pad)
+            logits,_ = dec(tgt_in, mem, fut, dec_pad, enc_pad)
+            B,T,V = logits.shape
+            loss = crit(logits.view(B*T,V), tgt_out.view(B*T))
+            total_loss += loss.item(); steps += 1
+    return total_loss/steps if steps>0 else 0.0
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir", default="data")
+    p.add_argument("--vocab", type=int, default=5000)
+    p.add_argument("--d_model", type=int, default=128)
+    p.add_argument("--num_heads", type=int, default=8)
+    p.add_argument("--num_layers", type=int, default=2)
+    p.add_argument("--d_ff", type=int, default=512)
+    p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--pos_encoding", choices=("rope","rpb"), default="rope")
+    p.add_argument("--out_dir", default="exp")
+    p.add_argument("--split", action="store_true", help="create train/val/test splits from data/src.txt,data/tgt.txt")
+    args = p.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    if args.split:
+        src_path = os.path.join(args.data_dir,"src.txt")
+        tgt_path = os.path.join(args.data_dir,"tgt.txt")
+        make_splits(src_path, tgt_path, args.data_dir)
+
+    train_src = os.path.join(args.data_dir,"train.src.txt")
+    train_tgt = os.path.join(args.data_dir,"train.tgt.txt")
+    val_src = os.path.join(args.data_dir,"val.src.txt")
+    val_tgt = os.path.join(args.data_dir,"val.tgt.txt")
+    if not (os.path.exists(train_src) and os.path.exists(train_tgt)):
+        raise SystemExit("Train split not found; run with --split or prepare train.src.txt/train.tgt.txt in data_dir")
+
+    train_src_lines = read_id_file(train_src); train_tgt_lines = read_id_file(train_tgt)
+    val_src_lines = read_id_file(val_src); val_tgt_lines = read_id_file(val_tgt)
+
+    train_ds = ParallelIdDataset(train_src_lines, train_tgt_lines)
+    val_ds = ParallelIdDataset(val_src_lines, val_tgt_lines)
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, collate_fn=collate_fn, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, collate_fn=collate_fn, num_workers=2)
+
+    enc = TransformerEncoder(args.vocab, args.d_model, args.num_layers, args.num_heads, args.d_ff, pad_idx=PAD_IDX, pos_encoding=args.pos_encoding).to(device)
+    dec = TransformerDecoder(args.vocab, args.d_model, args.num_layers, args.num_heads, args.d_ff, pad_idx=PAD_IDX, self_pos_encoding=args.pos_encoding).to(device)
+
+    params = list(enc.parameters()) + list(dec.parameters())
+    opt = optim.Adam(params, lr=args.lr)
+    crit = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+
+    csv_path = os.path.join(args.out_dir, f"loss_{args.pos_encoding}.csv")
+    with open(csv_path, "w", newline='') as csvf:
+        writer = csv.writer(csvf)
+        writer.writerow(["epoch","train_loss","val_loss"])
+        for ep in range(1, args.epochs+1):
+            tr = train_epoch(enc, dec, train_loader, opt, crit, device, args)
+            va = eval_epoch(enc, dec, val_loader, crit, device, args)
+            writer.writerow([ep, tr, va])
+            print(f"epoch {ep} train {tr:.4f} val {va:.4f}")
+            ckpt = {"encoder": enc.state_dict(), "decoder": dec.state_dict(), "args": vars(args)}
+            torch.save(ckpt, os.path.join(args.out_dir, f"checkpoint_ep{ep}_{args.pos_encoding}.pt"))
+    # save final config
+    with open(os.path.join(args.out_dir,"train_args.json"), "w") as jf:
+        json.dump(vars(args), jf, indent=2)
+
+if __name__ == "__main__":
+    main()

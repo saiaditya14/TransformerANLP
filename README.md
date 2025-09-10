@@ -27,7 +27,7 @@ python -u train.py \
   --d_ff 1024 \                         # Feed-forward dimension
   --batch 32 \                          # Batch size
   --epochs 5 \                          # Number of epochs
-  --pos_encoding rpb \                  # Positional encoding type
+  --pos_encoding rope \                  # Positional encoding type
   --out_dir "$OUTDIR" \                 # Output directory for logs and checkpoints
   --split \                             # Enable train/validation split
   |& tee "${OUTDIR}/training.log"       # Log output to file and console

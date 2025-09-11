@@ -44,3 +44,9 @@ tail -n 20 "${OUTDIR}/training.log"
 - Modify hyperparameters (e.g., `--d_model`, `--epochs`) based on your requirements.
 
 For additional details, refer to the project documentation or source files.
+
+
+Below are links two models, trained to translate from Finnish to English from the provided assignment dataset:
+
+RoPE:https://drive.google.com/file/d/1GQk5P-6fvrlqN288eTLZBAUC744fyobW/view?usp=sharing
+RPB:https://drive.google.com/file/d/1h4NCkyaMpkHcpVyZsZOnij-4XLhFUoEf/view?usp=sharing
